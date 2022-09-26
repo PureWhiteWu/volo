@@ -5,6 +5,7 @@
 )]
 #![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
 
+mod either;
 pub mod error;
 mod message;
 mod message_wrapper;
