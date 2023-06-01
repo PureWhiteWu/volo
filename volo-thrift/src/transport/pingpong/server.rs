@@ -56,95 +56,81 @@ pub async fn serve<Svc, Req, Resp, E, D, SP>(
                     }
                 }
 
-                let result = async {
-                    let msg = tokio::select! {
-                        out = async {
-                            let msg = decoder.decode(&mut cx).await;
-                            span_provider.leave_decode(&cx);
-                            msg
-                        }.instrument(span_provider.on_decode()) => out,
-                        _ = &mut notified => {
-                            tracing::trace!("[VOLO] close conn by notified, peer_addr: {:?}", peer_addr);
-                            return Err(());
-                        },
-                    };
-                    debug!(
-                        "[VOLO] received message: {:?}, rpcinfo: {:?}, peer_addr: {:?}",
-                        msg.as_ref().map(|msg| msg.as_ref().map(|msg| &msg.meta)),
-                        cx.rpc_info,
-                        peer_addr
-                    );
+                let msg = tokio::select! {
+                    _ = &mut notified => {
+                        tracing::trace!("[VOLO] close conn by notified, peer_addr: {:?}", peer_addr);
+                        return
+                    },
+                    out = decoder.decode(&mut cx) => out
+                };
 
-                    match msg {
-                        Ok(Some(ThriftMessage { data: Ok(req), .. })) => {
-                            cx.stats.record_process_start_at();
-                            let resp = service.call(&mut cx, req).await;
-                            cx.stats.record_process_end_at();
+                debug!(
+                    "[VOLO] received message: {:?}, rpcinfo: {:?}, peer_addr: {:?}",
+                    msg.as_ref().map(|msg| msg.as_ref().map(|msg| &msg.meta)),
+                    cx.rpc_info,
+                    peer_addr
+                );
 
-                            if exit_mark.load(Ordering::Relaxed) {
-                                cx.transport.set_conn_reset(true);
-                            }
+                match msg {
+                    Ok(Some(ThriftMessage { data: Ok(req), .. })) => {
+                        cx.stats.record_process_start_at();
+                        let resp = service.call(&mut cx, req).await;
+                        cx.stats.record_process_end_at();
 
-                            if cx.req_msg_type.unwrap() != TMessageType::OneWay {
-                                cx.msg_type = Some(match resp {
-                                    Ok(_) => TMessageType::Reply,
-                                    Err(_) => TMessageType::Exception,
-                                });
-                                let msg =
-                                    ThriftMessage::mk_server_resp(&cx, resp.map_err(|e| e.into()))
-                                        .unwrap();
-                                if let Err(e) = async {
-                                    let result = encoder.encode(&mut cx, msg).await;
-                                    span_provider.leave_encode(&cx);
-                                    result
-                                }.instrument(span_provider.on_encode()).await {
-                                    // log it
-                                    error!("[VOLO] server send response error: {:?}, rpcinfo: {:?}, peer_addr: {:?}", e, cx.rpc_info, peer_addr);
-                                    stat_tracer.iter().for_each(|f| f(&cx));
-                                    return Err(());
-                                }
-                            }
+                        if exit_mark.load(Ordering::Relaxed) {
+                            cx.transport.set_conn_reset(true);
                         }
-                        Ok(Some(ThriftMessage { data: Err(_), .. })) => {
-                            volo_unreachable!();
-                        }
-                        Ok(None) => {
-                            trace!("[VOLO] reach eof, connection has been closed by client, peer_addr: {:?}", peer_addr);
-                            return Err(());
-                        }
-                        Err(e) => {
-                            error!("[VOLO] pingpong server decode error: {:?}, peer_addr: {:?}", e, peer_addr);
-                            cx.msg_type = Some(TMessageType::Exception);
-                            if !matches!(e, Error::Transport(_)) {
-                                let msg = ThriftMessage::mk_server_resp(&cx, Err::<DummyMessage, _>(e))
+
+                        if cx.req_msg_type.unwrap() != TMessageType::OneWay {
+                            cx.msg_type = Some(match resp {
+                                Ok(_) => TMessageType::Reply,
+                                Err(_) => TMessageType::Exception,
+                            });
+                            let msg =
+                                ThriftMessage::mk_server_resp(&cx, resp.map_err(|e| e.into()))
                                     .unwrap();
-                                if let Err(e) = encoder.encode(&mut cx, msg).await {
-                                    error!("[VOLO] server send error error: {:?}, rpcinfo: {:?}, peer_addr: {:?}", e, cx.rpc_info, peer_addr);
-                                }
+                            if let Err(e) = encoder.encode(&mut cx, msg).await {
+                                // log it
+                                error!("[VOLO] server send response error: {:?}, rpcinfo: {:?}, peer_addr: {:?}", e, cx.rpc_info, peer_addr);
+                                stat_tracer.iter().for_each(|f| f(&cx));
+                                return;
                             }
-                            stat_tracer.iter().for_each(|f| f(&cx));
-                            return Err(());
                         }
                     }
-                    stat_tracer.iter().for_each(|f| f(&cx));
-
-                    metainfo::METAINFO.with(|mi| {
-                        mi.borrow_mut().clear();
-                    });
-
-                    span_provider.leave_serve(&cx);
-                    SERVER_CONTEXT_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if cache.len() < cache.capacity() {
-                            cx.reset(Default::default());
-                            cache.push(cx);
+                    Ok(Some(ThriftMessage { data: Err(_), .. })) => {
+                        volo_unreachable!();
+                    }
+                    Ok(None) => {
+                        trace!("[VOLO] reach eof, connection has been closed by client, peer_addr: {:?}", peer_addr);
+                        return;
+                    }
+                    Err(e) => {
+                        error!("[VOLO] pingpong server decode error: {:?}, peer_addr: {:?}", e, peer_addr);
+                        cx.msg_type = Some(TMessageType::Exception);
+                        if !matches!(e, Error::Transport(_)) {
+                            let msg = ThriftMessage::mk_server_resp(&cx, Err::<DummyMessage, _>(e))
+                                .unwrap();
+                            if let Err(e) = encoder.encode(&mut cx, msg).await {
+                                error!("[VOLO] server send error error: {:?}, rpcinfo: {:?}, peer_addr: {:?}", e, cx.rpc_info, peer_addr);
+                            }
                         }
-                    });
-                    Ok(())
-                }.instrument(span_provider.on_serve()).await;
-                if let Err(_) = result {
-                    break;
+                        stat_tracer.iter().for_each(|f| f(&cx));
+                        return;
+                    }
                 }
+                stat_tracer.iter().for_each(|f| f(&cx));
+
+                metainfo::METAINFO.with(|mi| {
+                    mi.borrow_mut().clear();
+                });
+
+                SERVER_CONTEXT_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if cache.len() < cache.capacity() {
+                        cx.reset(Default::default());
+                        cache.push(cx);
+                    }
+                });
             }
         }).await;
 }
