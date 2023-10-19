@@ -24,7 +24,6 @@ pub struct ThriftMessage<M> {
 
 pub(crate) struct DummyMessage;
 
-#[async_trait::async_trait]
 impl EntryMessage for DummyMessage {
     #[inline]
     fn encode<T: TOutputProtocol>(&self, _protocol: &mut T) -> Result<(), EncodeError> {
